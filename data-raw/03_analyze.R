@@ -1,17 +1,19 @@
 
 library(tidyverse)
-data('commish', package = 'ercotgis')
-data('inactive', package = 'ercotgis')
-data('cancel', package = 'ercotgis')
+# data('commish', package = 'ercotgis')
+# data('inactive', package = 'ercotgis')
+# data('cancel', package = 'ercotgis')
 data('details', package = 'ercotgis')
+data('gis_status', package = 'ercotgis')
 
 project_names <-
   details %>%
   group_by(inr) %>%
-  filter(date_report == max(date_report)) %>%
+  # filter(date_report == max(date_report)) %>%
+  slice_max(date_report, n = 1L) %>%
   ungroup() %>%
   select(inr, name, ie = interconnecting_entity)
-project_names
+project_names %>% filter(name %>% str_detect('Cook'))
 
 .f_details <- function(f, ...) {
   details %>%
@@ -23,13 +25,22 @@ project_names
 latest_details <- .f_details(max)
 first_details <- .f_details(min)
 
-.month_diff <- function(m1, m2) {
-  {m1 - m2} %>% lubridate::time_length(unit = 'months') %>% round() %>% as.integer()
+.date_diff_frac <- function(d1, d2, unit) {
+  {d1 - d2} %>% lubridate::time_length(unit = unit)
 }
+
+.month_diff_frac <- partial(.date_diff_frac, unit = 'months', ... = )
+
+.date_diff <- function(d1, d2, unit) {
+  {d1 - d2} %>% lubridate::time_length(unit = unit) %>% round() %>% as.integer()
+}
+
+# .day_diff <- partial(.date_diff, unit = 'days', ... = )
+.month_diff <- partial(.date_diff, unit = 'months', ... = )
 
 projected_cods <-
   details %>%
-  select(inr, fuel, date_report, projected_cod) %>%
+  select(inr, date_report, projected_cod) %>%
   left_join(
     first_details %>%
       select(
@@ -39,45 +50,198 @@ projected_cods <-
       ) %>%
       rename_with(~sprintf('%s_earliest', .x), c(date_report, projected_cod))
   ) %>%
-  left_join(project_names) %>%
-  arrange(name, date_report) %>%
-  mutate(across(projected_cod, list(prev = dplyr::lag))) %>%
+  arrange(inr, date_report) %>%
+  group_by(inr) %>%
+  mutate(across(c(date_report, projected_cod), list(prev = dplyr::lag))) %>%
+  ungroup() %>%
   mutate(
-    diff_cod = -.month_diff(projected_cod, date_report),
-    diff_cod_prev = .month_diff(projected_cod, projected_cod_prev)
+    months_frac_fis = .month_diff_frac(fis_approved, fis_reqeuested),
+    months_frac_fis2ener = .month_diff_frac(approved_for_energization, fis_approved),
+    months_frac_ener2sync = .month_diff_frac(approved_for_synchronization, approved_for_energization)
+    months_since_last_report = .month_diff(date_report, date_report_prev),
+    months_till_cod = .month_diff(projected_cod, date_report),
+    # days_till_cod = .day_diff(projected_cod, date_report),
+    months_frac_till_cod = .month_diff_frac(projected_cod, date_report) # ,
+    # cod_days_diff = .day_diff(projected_cod, projected_cod_prev)
+  ) %>%
+  arrange(inr, date_report) %>%
+  mutate(
+    month_of_last_cod_change = case_when(
+      (months_since_last_report == + 1L) & (projected_cod != projected_cod_prev) ~ date_report,
+      TRUE ~ NA_real_
+    ),
+    months_frac_cod_change_last = if_else(!is.na(month_of_last_cod_change), .month_diff_frac(projected_cod, projected_cod_prev), NA_real_)
+  ) %>%
+  group_by(inr) %>%
+  fill(month_of_last_cod_change, months_frac_cod_change_last, .direction = 'down') %>%
+  ungroup() %>%
+  mutate(
+    months_since_last_cod_change = +.month_diff(date_report, month_of_last_cod_change)
   )
-projected_cods
+projected_cods %>% filter(months_since_last_cod_change > 0) # months after cod change
+projected_cods %>% filter(months_since_last_cod_change == 0) # month of cod change
 
 gis_status_latest <-
-  list(
-    commish %>%
-      select(inr, date_report, commissioning_category) %>%
-      mutate(gis_status = 'commissioned'),
-    inactive %>%
-      select(inr, date_report) %>%
-      mutate(gis_status = 'inactive'),
-    cancel %>%
-      select(inr, date_report) %>%
-      mutate(gis_status = 'cancelled')
-  ) %>%
-  reduce(bind_rows) %>%
-  group_by(gis_status, commissioning_category, inr) %>%
-  filter(row_number(desc(date_report)) == 1L) %>%
+  gis_status %>%
+  # In case a unit is reported twice. This is definitely true for inactive units.
+  group_by(gis_status, inr) %>%
+  filter(row_number(desc(date)) == 1L) %>%
   ungroup() %>%
   rename_with(~sprintf('%s_latest', .x), -c(inr))
 gis_status_latest
 
-details_w_status_latest <-
-  details %>%
-  inner_join(gis_status_latest) %>%
-  # These are already in details
-  inner_join(projected_cods %>% select(-fuel, -name, -ie))
-details_w_status_latest
+# gis_status_latest %>% filter(inr %in% c('20INR0031', '20INR0261')) %>% arrange(inr, date_latest) %>% left_join(project_names) # inactive, then re-activated
+gis_status_latest_wide <-
+  gis_status_latest %>%
+  select(-date_report_latest) %>%
+  pivot_wider(
+    names_from = gis_status_latest,
+    values_from = date_latest,
+    names_glue = '{gis_status_latest}_latest'
+  ) %>%
+  mutate(
+    months_frac_sync2comm = .month_diff_frac(commercial_latest, synchronization_latest),
+    months_frac_ener2sync = .month_diff_frac(synchronization_latest, energization_latest)
+  )
+gis_status_latest_wide
+
+inrs_reactivated <- gis_status_latest_wide %>% filter(inactive_latest < energization_latest) %>% distinct(inr) %>% pull(inr)
+# gis_status_latest_wide %>% filter(!is.na(energization_latest)) %>% head(2) %>% inner_join(details %>% select(inr, approved_for_energization))
+# gis_status_latest_wide %>% filter(inr == '18INR0039')
+# gis_status_latest_wide %>%
+#   filter(!is.na(synchronization_latest)) %>%
+#   filter(!is.na(energization_latest))
+#
+# gis_status_latest_wide %>%
+#   filter(!is.na(commercial_latest)) %>%
+#   tail() %>%
+#   inner_join(project_names)
+
+`%m+%` <- lubridate::`%m+%`
+`%m-%` <- lubridate::`%m-%`
+.add_months <- function(x, n = 1) {
+  x %m+% lubridate::period(n, unit = 'month')
+}
 
 .subtract_months <- function(x, n = 1) {
-  res <- x %m-% lubridate::period(n, unit = 'month')
-  res
+  x %m-% lubridate::period(n, unit = 'month')
 }
+
+# details %>%
+#   left_join(gis_status_latest_wide) %>%
+#   filter(!is.na(inactive_latest) & !is.na(energization_latest) & energization_latest > inactive_latest) %>%
+#   # filter(name %>% str_detect('Cook')) %>%
+#   # count(inr, name)
+#   group_by(inr) %>%
+#   # slice_max(date_report, n = 1) %>%
+#   filter(row_number(desc(date_report)) == 1L) %>%
+#   ungroup()
+
+details_w_status_latest <-
+  details %>%
+  left_join(gis_status_latest_wide) %>%
+  inner_join(projected_cods) %>%
+  # Cancelled projects.
+  filter(!(date_report >= cancelled_latest & !is.na(cancelled_latest))) %>%
+  # Those that were made inactive and not re-activated. (This is actually missing those that have been re-activated but not yet energized, which is harder to catch.)
+  filter(inr %in% inrs_reactivated | !(date_report >= inactive_latest & !is.na(inactive_latest) )) %>% #  | date_report >= cancelled_latest))
+  # Eliminate those kept in reports after they go commercial (should be 0 anyways).
+  filter(!(date_report >= commercial_latest & !is.na(commercial_latest))) %>%
+  mutate(
+    months_frac_since_sync = .month_diff_frac(synchronization_latest, .subtract_months(date_report, 1)),
+    months_frac_since_ener = .month_diff_frac(energization_latest, .subtract_months(date_report, 1))
+  ) %>%
+  mutate(across(matches('^months_frac_since_'), ~if_else(.x < 0, NA_real_, .x)))
+details_w_status_latest
+
+sync2comm_agg <-
+  details_w_status_latest %>%
+  # filter(date_report > '2020-01-01') %>%
+  # filter(months_frac_since_ener < 1) %>%
+  filter(!is.na(commercial_latest) & !is.na(energization_latest)) %>%
+  select(inr, name, date_report, matches('_latest$'), matches('^months_frac_.*2')) %>%
+  group_by(inr) %>%
+  slice_max(date_report) %>%
+  ungroup() %>%
+  # skimr::skim(matches('^months_frac_.*2comm'))
+  summarize(
+    across(months_frac_sync2comm, list(min = min, mean = mean, max = max, median = median), .names = '{fn}')
+  )
+sync2comm_agg
+
+
+df <-
+  details_w_status_latest %>%
+  select(
+    inr,
+    name,
+    ginr_study_phase,
+    cdr_zone,
+    fuel,
+    capacity_mw,
+    date_report,
+    projected_cod,
+    months_till_cod
+  ) %>%
+  .add_season_col('projected_cod') %>%
+  .add_season_col('date_report,') %>%
+  separate(ginr_study_phase, into = c('ss', 'fis', 'ia'), sep = '\\,\\s+') %>%
+  filter(!(fuel %in% c('COA', 'COAL'))) %>%
+  mutate(
+    months_till = .month_diff(month_y, month_x),
+    across(
+      c(ss, fis),
+      ~if_else(.x %>% str_detect('Completed'), 1L, 0L)
+    ),
+    across(ia, ~if_else(.x %>% str_detect('No'), 0L, 1L)),
+    across(c(months_till_cod, ss, fis, ia, cdr_zone), factor)
+  )
+
+
+.add_season_col <- function(data, col, suffix = 'season') {
+  col_sym <- col %>% sym()
+  col_out <- sprintf('%s_%s', col, suffix)
+  col_out_sym <- col_out %>% sym()
+  data %>%
+    mutate(
+      .mm = !!col_sym %>% lubridate::month(),
+      !!col_out_sym := case_when(
+        .mm %in% c(12, 1, 2) ~ 'winter',
+        .mm %in% 3:5 ~ 'spring',
+        .mm %in% 6:9 ~ 'summer',
+        .mm %in% 10:11 ~ 'fall'
+      ) %>%
+        factor()
+    ) %>%
+    select(-.mm)
+}
+
+details_w_status_latest %>%
+  .add_season_col('date_report')
+
+cols_lst <-
+  c(
+    col_y = 'months_frac_till_cod',
+    cols_x = c(
+      'cdr_zone',
+      'fuel',
+      'capaciy_mw',
+      'ginr_study_phase',
+      'season_report',
+      'months_frac_since_sync',
+      'months_frac_since_ener'
+      'month_x',
+    ),
+    cols_id = c('inr', 'name')
+  )
+
+model_data <-
+  details_w_status_latest %>%
+  select(
+    year_report,
+    month_report
+  )
+
 
 y_info <-
   details_w_status_latest %>%
@@ -108,23 +272,6 @@ y_info %>%
 details %>%
   inner_join(y_info %>% rename(date_report = date_y))
 
-.add_season_col <- function(data, col, suffix = 'season') {
-  col_sym <- col %>% sym()
-  col_out <- sprintf('%s_%s', col, suffix)
-  col_out_sym <- col_out %>% sym()
-  data %>%
-    mutate(
-      .mm = !!col_sym %>% lubridate::month(),
-      !!col_out_sym := case_when(
-        .mm %in% c(12, 1, 2) ~ 'winter',
-        .mm %in% 3:5 ~ 'spring',
-        .mm %in% 6:9 ~ 'summer',
-        .mm %in% 10:11 ~ 'fall'
-      ) %>%
-        factor()
-    ) %>%
-    select(-.mm)
-}
 
 dt1 <- details %>% mutate(..date_report = date_report) %>% data.table::as.data.table()
 dt2 <- y_info %>% mutate(.date_report = date_y) %>% data.table::as.data.table()
@@ -162,7 +309,7 @@ prep_data <- function(data) {
     separate(ginr_study_phase, into = c('ss', 'fis', 'ia'), sep = '\\,\\s+') %>%
     filter(!(fuel %in% c('COA', 'COAL'))) %>%
     mutate(
-      months_till = .month_diff(date_y, month_x),
+      days_till = .day_diff(date_y, month_x),
       across(
         c(ss, fis),
         ~if_else(.x %>% str_detect('Completed'), 1L, 0L)
@@ -194,7 +341,7 @@ unlabelled <-
 unlabelled
 
 col_y <- 'y'
-fmla <- paste0(col_y, ' ~ cdr_zone + month_x_season + date_y_season + months_till + ss + fis + ia + fuel') %>% as.formula()
+fmla <- paste0(col_y, ' ~ cdr_zone + month_x_season + date_y_season + days_till + ss + fis + ia + fuel') %>% as.formula()
 set.seed(42)
 # split <- df %>% rsample::initial_split(strata = all_of(col_y))
 # trn <- split %>% rsample::training()
@@ -332,7 +479,7 @@ rules_united <-
           'cdr_zone' = 'CDR zone',
           'date_y_season' = 'projected COD season',
           'month_x_season' = 'current season',
-          'months_till' = 'months between current month and projected COD month',
+          'days_till' = 'months between current month and projected COD month',
           'SOL' = 'solar',
           'GAS' = 'gas',
           'WIN' = 'wind',
@@ -413,7 +560,7 @@ preds_export <-
     `Completed SS` = ss,
     `CDR Zone` = cdr_zone,
     `Fuel` = fuel,
-    `Months Till Projected COD` = months_till,
+    `Months Till Projected COD` = days_till,
     `Current Month` = month_x,
     `Projected COD Season` = date_y_season,
     `Current Month Season` = month_x_season,

@@ -31,7 +31,7 @@ paths
 .switch_sheet_type <- function(sheet_type) {
   valid_sheet_types <- .get_valid_sheet_type()
   .validate_sheet_type(sheet_type)
-  lst <- setNames(c('commish', 'inactive', 'cancel', 'details'), valid_sheet_types)
+  lst <- setNames(c('commiss', 'inactive', 'cancel', 'details'), valid_sheet_types)
   lst[[sheet_type]]
 }
 
@@ -52,19 +52,74 @@ paths
   match.arg(x, ...)
 }
 
+.fix_cols_date <- function(data, cols_id, cols_date) {
+  # browser()
+  res_init <-
+    data %>%
+    mutate(
+      across(
+        any_of(cols_date),
+        list(
+          a = ~as.double(.x) %>% janitor::excel_numeric_to_date(),
+          b = lubridate::mdy,
+          c = ~lubridate::ymd_hms(.x) %>% lubridate::date(),
+          d = lubridate::ymd
+        )
+      )
+    )
+
+  rgx_suffix <- '[abcd]$'
+  res <-
+    res_init %>%
+    select(any_of(cols_id), matches(sprintf('_%s', rgx_suffix))) %>%
+    pivot_longer(
+      -any_of(cols_id)
+    ) %>%
+    mutate(
+      across(
+        name,
+        list(
+          prefix = ~.x %>% str_remove(sprintf('_%s', rgx_suffix)),
+          prefix_idx = ~.x %>% str_replace(sprintf('(^.*)(%s)', rgx_suffix), '\\2')
+        ),
+        .names = '{fn}'
+      )
+    ) %>%
+    select(-name) %>%
+    pivot_wider(
+      names_from = prefix_idx,
+      values_from = value
+    ) %>%
+    mutate(value = coalesce(a, b, c, d)) %>%
+    select(-matches(sprintf('^%s', rgx_suffix))) %>%
+    # pivot_wider(names_from = prefix, names_glue = '{prefix}_impute', values_from = value)
+    pivot_wider(names_from = prefix, values_from = value)
+  res
+}
+
 .postprocess_gis_sheet <- function(data, sheet_type, date) {
 
   if(sheet_type != 'Details') {
     col_date <- .switch_col_date(sheet_type)
-    # browser()
-    res <-
+    # # browser()
+    # if(sheet_type == 'Commissioning') {
+    #   browser()
+    # }
+    res_init <-
       data %>%
       janitor::clean_names() %>%
       mutate_all(as.character) %>%
       filter(!is.na(project_name)) %>%
       select(-matches('^x')) %>%
-      rename(date = !!sym(col_date)) %>%
-      mutate(across(date, ~lubridate::ymd_hms(.x) %>% lubridate::date()))
+      rename(date = !!sym(col_date))
+      # mutate(across(date, ~lubridate::ymd_hms(.x) %>% lubridate::date()))
+    res_date <-
+      res_init %>%
+      .fix_cols_date(cols_id = c('inr', 'commissioning_category'), cols_date = 'date')
+    res <-
+      res_init %>%
+      select(-date) %>%
+      left_join(res_date)
     return(res)
   }
 
@@ -98,6 +153,7 @@ import_by_sheet <- function(sheet_type = .get_valid_sheet_types(), skip = .switc
   .validate_sheet_type(sheet_type)
   # sheet_type <- 'Details'
   # skip <- 28
+
   .display_info('Importing data or `sheet_type = "{sheet_type}"`.')
   res_init <-
     paths %>%
@@ -145,7 +201,8 @@ assign_sheet_gis <- function(sheet_type, name = .switch_sheet_type(sheet_type), 
 valid_sheet_types <- .get_valid_sheet_type()
 assign_sheet_gis_robustly <- possibly(assign_sheet_gis, otherwise = NULL)
 walk(valid_sheet_types, assign_sheet_gis_robustly)
-walk('Details', assign_sheet_gis_robustly)
+# walk('Details', assign_sheet_gis_robustly)
+# commiss %>% filter(is.na(date))
 
 details <-
   details %>%
@@ -155,66 +212,10 @@ details <-
   # arrange(inr, date_report) %>%
   mutate(idx = row_number()) %>%
   relocate(idx)
-z <- details %>% select(idx, date_report, inr, name, projected_cod) %>% arrange(inr, date_report) %>% head(10)
-z
 
 cols_date <- c('projected_cod', 'approval_date_for_submission_of_proof_of_site_control', 'screening_start', 'screening_complete', 'fis_requested', 'fis_approved', 'ia_signed', 'air_permit', 'ghg_permit', 'water_avail', 'meets_planning_guide_6_9_1', 'meets_all_planning_guide_section_6_9', 'meets_planning_guide_qsa_prereqs', 'construction_start', 'construction_end', 'approved_for_energization', 'approved_for_synchronization')
 
-details_date_init <-
-  details %>%
-  mutate(
-    across(
-      any_of(cols_date),
-      list(
-        a = ~as.double(.x) %>% janitor::excel_numeric_to_date(),
-        b = lubridate::ymd,
-        c = lubridate::mdy,
-        d = ~lubridate::ymd_hms(.x) %>% lubridate::date()
-      )
-    )
-  )
-
-rgx_suffix <- '[abcd]$'
-details_date <-
-  details_date_init %>%
-  select(idx, matches(sprintf('_%s', rgx_suffix))) %>%
-  pivot_longer(
-    -idx
-  ) %>%
-  mutate(
-    across(
-      name,
-      list(
-        prefix = ~.x %>% str_remove(sprintf('_%s', rgx_suffix)),
-        prefix_idx = ~.x %>% str_replace(sprintf('(^.*)(%s)', rgx_suffix), '\\2')
-      ),
-      .names = '{fn}'
-    )
-  ) %>%
-  select(-name) %>%
-  pivot_wider(
-    names_from = prefix_idx,
-    values_from = value
-  ) %>%
-  mutate(value = coalesce(a, b, c, d)) %>%
-  select(-matches(sprintf('^%s', rgx_suffix))) %>%
-  # pivot_wider(names_from = prefix, names_glue = '{prefix}_impute', values_from = value)
-  pivot_wider(names_from = prefix, values_from = value)
-details_date
-
-details %>% select(any_of(names(z))) %>% semi_join(z %>% select(-projected_cod))
-
-# .coalesce_col <- function(data, col) {
-#   col_other <- sprintf('%s_impute', col)
-#   col_sym <- col %>% sym()
-#   col_other_sym <- col_other %>% sym()
-#   data %>%
-#     select(idx, !!col_sym, !!col_other_sym) %>%
-#     mutate(!!col_sym := coalesce(!!col_sym, as.character(!!col_other_sym)) %>% lubridate::ymd())
-# }
-# cols_date %>%
-#   map(~.coalesce_col(details_clean, col = .x)) %>%
-#   reduce(bind_rows)
+details_date <- details %>% .fix_cols_date(cols_id = 'idx', cols_date = cols_date)
 
 details <-
   details %>%
@@ -225,5 +226,40 @@ details <-
   select(-any_of(cols_date)) %>%
   left_join(details_date)
 details
-# details %>% filter(is.na(projected_cod))
-usethis::use_data(details, commish, cancel, inactive, overwrite = TRUE)
+# details %>% select(inr, name, date_report, projected_cod) %>% arrange(projected_cod)
+gis_status <-
+  list(
+    commiss %>%
+      mutate(
+        across(
+          commissioning_category,
+          list(
+            gis_status = ~case_when(
+              str_detect(.x, 'ommerci') ~ 'commercial',
+              str_detect(.x, 'nergiz') ~ 'energization',
+              str_detect(.x, 'ynchr') ~ 'synchronization',
+              TRUE ~ NA_character_
+            )
+          ),
+          .names = '{fn}'
+        )
+      ) %>%
+      select(inr, date_report, gis_status, date),
+    inactive %>%
+      mutate(gis_status = 'inactive') %>%
+      select(inr, date_report, gis_status, date),
+    cancel %>%
+      mutate(gis_status = 'cancelled') %>%
+      select(inr, date_report, gis_status, date)
+  ) %>%
+  reduce(bind_rows)
+
+# gis_status %>% count(gis_status)
+# gis_status %>% filter(is.na(gis_status))
+# gis_status %>%
+#   count(gis_status, na_date = is.na(date), date_report) %>%
+#   pivot_wider(names_from = na_date, values_from = n, values_fill = 0) %>%
+#   filter(`TRUE` > 1) %>%
+#   arrange(date_report)
+
+usethis::use_data(details, gis_status, commiss, cancel, inactive, overwrite = TRUE)
